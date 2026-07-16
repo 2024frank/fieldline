@@ -26,12 +26,17 @@ def db():
         dev_eui TEXT, device TEXT, ts TEXT, f_cnt INTEGER,
         rssi INTEGER, snr REAL, data TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_dev ON readings(dev_eui, id)")
+    try:
+        c.execute("ALTER TABLE readings ADD COLUMN gw TEXT")  # which gateway heard it
+    except sqlite3.OperationalError:
+        pass  # column already there
     return c
 
 def rowdict(r):
     if not r: return {}
     return {"devEui": r[0], "device": r[1], "time": r[2],
-            "rssi": r[3], "snr": r[4], "data": json.loads(r[5] or "{}")}
+            "rssi": r[3], "snr": r[4], "data": json.loads(r[5] or "{}"),
+            "gw": r[6] if len(r) > 6 else None}
 
 # ---- MQTT consumer ----
 def on_connect(client, userdata, flags, rc):
@@ -44,9 +49,10 @@ def on_message(client, userdata, msg):
         di = e.get("deviceInfo", {})
         rx = (e.get("rxInfo") or [{}])[0]
         c = db()
-        c.execute("INSERT INTO readings(dev_eui,device,ts,f_cnt,rssi,snr,data) VALUES(?,?,?,?,?,?,?)",
+        c.execute("INSERT INTO readings(dev_eui,device,ts,f_cnt,rssi,snr,data,gw) VALUES(?,?,?,?,?,?,?,?)",
                   (di.get("devEui"), di.get("deviceName"), e.get("time"), e.get("fCnt"),
-                   rx.get("rssi"), rx.get("snr"), json.dumps(e.get("object") or {})))
+                   rx.get("rssi"), rx.get("snr"), json.dumps(e.get("object") or {}),
+                   (rx.get("gatewayId") or "").lower() or None))
         c.commit(); c.close()
         print("stored uplink from", di.get("devEui"), flush=True)
     except Exception as ex:
@@ -85,7 +91,7 @@ def readings():
     except ValueError:
         limit = 500
     c = db()
-    rows = c.execute("SELECT dev_eui,device,ts,rssi,snr,data FROM readings ORDER BY id DESC LIMIT 5000").fetchall()
+    rows = c.execute("SELECT dev_eui,device,ts,rssi,snr,data,gw FROM readings ORDER BY id DESC LIMIT 5000").fetchall()
     c.close()
     allr = [rowdict(x) for x in rows]  # newest first
 

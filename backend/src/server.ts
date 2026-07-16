@@ -161,11 +161,11 @@ app.use("/*", async (c, next) => {
 });
 
 // ---------- helpers ----------
-async function latestByEui(euis: Set<string>): Promise<Record<string, { measurements: Record<string, number>; time: string; rssi?: number; snr?: number }>> {
+async function latestByEui(euis: Set<string>): Promise<Record<string, { measurements: Record<string, number>; time: string; rssi?: number; snr?: number; gw?: string | null }>> {
   try {
     const r = await fetch(`${READINGS_URL}?latest=1`); const arr = (await r.json()) as any[];
     const out: Record<string, any> = {};
-    for (const x of arr) if (euis.has(x.devEui)) out[x.devEui] = { measurements: x.data ?? {}, time: x.time, rssi: x.rssi, snr: x.snr };
+    for (const x of arr) if (euis.has(x.devEui)) out[x.devEui] = { measurements: x.data ?? {}, time: x.time, rssi: x.rssi, snr: x.snr, gw: x.gw ?? null };
     return out;
   } catch { return {}; }
 }
@@ -366,6 +366,7 @@ app.post("/gateways", async (c) => {
     const { eui, name, location } = await c.req.json();
     await cs("POST", "/api/gateways", { gateway: {
       gatewayId: String(eui).toLowerCase(), name, tenantId: org.tenantId, statsInterval: 30,
+      downlinkPriority: 1, // ChirpStack rejects creates without it (undocumented)
       description: "Registered via Fieldline",
       location: location ? { latitude: location.lat, longitude: location.lng } : undefined,
     } });
@@ -429,6 +430,7 @@ app.get("/devices", async (c) => {
     eui: d.devEui, name: d.name, typeId: d.deviceProfileId, typeName: d.deviceProfileName,
     status: statusFrom(d.lastSeenAt ?? null), lastSeenAt: d.lastSeenAt ?? null,
     battery: battery(d), latest: latest[d.devEui] ?? null,
+    gatewayEui: latest[d.devEui]?.gw ?? null,
   }));
   return c.json({ items });
 });
@@ -438,11 +440,14 @@ app.get("/devices/:eui", async (c) => {
   const d = await ownedDevice(eui, org);
   if (!d) return c.json({ error: "not found" }, 404);
   const latest = (await latestByEui(new Set([eui])))[eui] ?? null;
+  let typeName = "";
+  try { typeName = (await cs<any>("GET", `/api/device-profiles/${d.device.deviceProfileId}`)).deviceProfile.name; } catch { /* optional */ }
   return c.json({
-    eui, name: d.device.name, typeId: d.device.deviceProfileId, typeName: "",
+    eui, name: d.device.name, typeId: d.device.deviceProfileId, typeName,
     status: statusFrom(d.lastSeenAt ?? null), lastSeenAt: d.lastSeenAt ?? null,
     battery: battery(d), latest, enabled: !d.device.isDisabled,
     rssi: latest?.rssi ?? null, snr: latest?.snr ?? null,
+    gatewayEui: latest?.gw ?? null,
   });
 });
 app.post("/devices", async (c) => {
