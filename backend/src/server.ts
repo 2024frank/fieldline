@@ -175,6 +175,12 @@ async function latestByEui(euis: Set<string>): Promise<Record<string, { measurem
     return out;
   } catch { return {}; }
 }
+// latest join / battery / error per device, from the datastore's event log
+const STATE_URL = READINGS_URL.replace(/\/readings$/, "/state");
+type DevState = { lastJoinAt?: string; battery?: number | null; margin?: number | null; extPower?: boolean; lastError?: { code: string; description: string; time: string } };
+async function deviceStates(): Promise<Record<string, DevState>> {
+  try { const r = await fetch(STATE_URL); return await r.json() as Record<string, DevState>; } catch { return {}; }
+}
 function statusFrom(lastSeenAt: string | null): "online" | "offline" | "never" {
   if (!lastSeenAt) return "never";
   return Date.now() - new Date(lastSeenAt).getTime() < 60 * 60 * 1000 ? "online" : "offline";
@@ -453,12 +459,13 @@ app.post("/device-types", async (c) => {
 app.get("/devices", async (c) => {
   const org = await orgOf(authUser(c)!);
   const euis = await orgEuis(org.appId);
-  const latest = await latestByEui(euis);
+  const [latest, states] = await Promise.all([latestByEui(euis), deviceStates()]);
   const devs = (await cs<any>("GET", `/api/devices?limit=100&applicationId=${org.appId}`)).result ?? [];
   const items = devs.map((d: any) => ({
     eui: d.devEui, name: d.name, typeId: d.deviceProfileId, typeName: d.deviceProfileName,
     status: statusFrom(d.lastSeenAt ?? null), lastSeenAt: d.lastSeenAt ?? null,
-    battery: battery(d), latest: latest[d.devEui] ?? null,
+    battery: battery(d) ?? states[d.devEui]?.battery ?? null,
+    latest: latest[d.devEui] ?? null,
     gatewayEui: latest[d.devEui]?.gw ?? null,
   }));
   return c.json({ items });
@@ -468,15 +475,20 @@ app.get("/devices/:eui", async (c) => {
   const eui = c.req.param("eui").toLowerCase();
   const d = await ownedDevice(eui, org);
   if (!d) return c.json({ error: "not found" }, 404);
-  const latest = (await latestByEui(new Set([eui])))[eui] ?? null;
+  const [latestMap, states] = await Promise.all([latestByEui(new Set([eui])), deviceStates()]);
+  const latest = latestMap[eui] ?? null;
+  const st = states[eui] ?? {};
   let typeName = "";
   try { typeName = (await cs<any>("GET", `/api/device-profiles/${d.device.deviceProfileId}`)).deviceProfile.name; } catch { /* optional */ }
   return c.json({
     eui, name: d.device.name, typeId: d.device.deviceProfileId, typeName,
     status: statusFrom(d.lastSeenAt ?? null), lastSeenAt: d.lastSeenAt ?? null,
-    battery: battery(d), latest, enabled: !d.device.isDisabled,
+    battery: battery(d) ?? st.battery ?? null, latest, enabled: !d.device.isDisabled,
     rssi: latest?.rssi ?? null, snr: latest?.snr ?? null,
     gatewayEui: latest?.gw ?? null,
+    margin: st.margin ?? null,
+    lastJoinAt: st.lastJoinAt ?? null,
+    lastError: st.lastError ?? null,
   });
 });
 app.post("/devices", async (c) => {
@@ -559,9 +571,10 @@ app.post("/devices/:eui/commands/reporting-interval", async (c) => {
 // ---------- alerts (computed, org-scoped) ----------
 app.get("/alerts", async (c) => {
   const org = await orgOf(authUser(c)!);
-  const [gws, devs] = await Promise.all([
+  const [gws, devs, states] = await Promise.all([
     cs<any>("GET", `/api/gateways?limit=100&tenantId=${org.tenantId}`),
     cs<any>("GET", `/api/devices?limit=100&applicationId=${org.appId}`),
+    deviceStates(),
   ]);
   const alerts: any[] = [];
   for (const g of gws.result ?? []) {
@@ -571,9 +584,13 @@ app.get("/alerts", async (c) => {
   for (const d of devs.result ?? []) {
     if (d.lastSeenAt && Date.now() - new Date(d.lastSeenAt).getTime() > 2 * 3600e3)
       alerts.push({ id: `dev:${d.devEui}`, type: "sensor_offline", target: d.name, message: `${d.name} last reported ${new Date(d.lastSeenAt).toLocaleString()}`, time: d.lastSeenAt });
-    const b = battery(d);
+    const st = states[d.devEui] ?? {};
+    const b = battery(d) ?? st.battery ?? null;
     if (b != null && b <= 15)
       alerts.push({ id: `bat:${d.devEui}`, type: "low_battery", target: d.name, message: `${d.name} battery at ${b}%`, time: d.lastSeenAt ?? new Date().toISOString() });
+    // real network errors from the event log (bad key, framing issues) in the last 24h
+    if (st.lastError && Date.now() - new Date(st.lastError.time).getTime() < 24 * 3600e3)
+      alerts.push({ id: `err:${d.devEui}`, type: "network_error", target: d.name, message: `${st.lastError.code}: ${st.lastError.description}`, time: st.lastError.time });
   }
   return c.json({ items: alerts.sort((a, b) => (b.time > a.time ? 1 : -1)) });
 });
