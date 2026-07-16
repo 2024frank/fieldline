@@ -10,7 +10,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import jwt from "jsonwebtoken";
 import { cs, verifyCredentials } from "./chirpstack.js";
-import { store, save, hashPassword, verifyPassword, sha256, randomId, randomHex, type AppUser } from "./store.js";
+import { store, save, userByEmail, hashPassword, verifyPassword, sha256, randomId, randomHex, type AppUser } from "./store.js";
 import { sendMail, welcomeOrgEmail, addedUserEmail, operatorEmail } from "./mailer.js";
 
 const PORT = Number(process.env.PORT ?? 4000);
@@ -78,7 +78,7 @@ function authUser(c: any): AppUser | null {
   const h = c.req.header("authorization") ?? "";
   try {
     const p = jwt.verify(h.replace(/^Bearer /, ""), SECRET) as any;
-    const u = store.get().users.find(x => x.email === p.sub);
+    const u = userByEmail(p.sub);   // O(1) index, not a per-request array scan
     return u ?? { id: p.sub, email: p.sub, name: p.sub.split("@")[0], role: p.role, mustChangePassword: false, source: "chirpstack", createdAt: new Date(0).toISOString() };
   } catch { return null; }
 }
@@ -178,8 +178,10 @@ async function latestByEui(euis: Set<string>): Promise<Record<string, { measurem
 // latest join / battery / error per device, from the datastore's event log
 const STATE_URL = READINGS_URL.replace(/\/readings$/, "/state");
 type DevState = { lastJoinAt?: string; battery?: number | null; margin?: number | null; extPower?: boolean; lastError?: { code: string; description: string; time: string; level?: string | null } };
-async function deviceStates(): Promise<Record<string, DevState>> {
-  try { const r = await fetch(STATE_URL); return await r.json() as Record<string, DevState>; } catch { return {}; }
+async function deviceStates(eui?: string): Promise<Record<string, DevState>> {
+  // eui set -> the datastore folds one device's events, not the whole org's.
+  const url = eui ? `${STATE_URL}?device=${eui}` : STATE_URL;
+  try { const r = await fetch(url); return await r.json() as Record<string, DevState>; } catch { return {}; }
 }
 function statusFrom(lastSeenAt: string | null): "online" | "offline" | "never" {
   if (!lastSeenAt) return "never";
@@ -408,14 +410,23 @@ app.delete("/gateways/:eui", async (c) => {
 });
 
 // ---------- device types (org-scoped ChirpStack device profiles) ----------
+// The catalog changes only when someone adds a type, but every dashboard/wizard
+// load reads it — and building it is an N+1 (one ChirpStack round-trip per
+// profile for the codec/measurements). Cache the built list per tenant with a
+// short TTL; invalidated on create. 13 upstream calls per load -> ~zero.
+const typeCache = new Map<string, { items: unknown[]; at: number }>();
+const TYPE_TTL = 60_000;
 app.get("/device-types", async (c) => {
   const org = await orgOf(authUser(c)!);
+  const hit = typeCache.get(org.tenantId);
+  if (hit && Date.now() - hit.at < TYPE_TTL) return c.json({ items: hit.items });
   const r = await cs<any>("GET", `/api/device-profiles?limit=100&tenantId=${org.tenantId}`);
   const items = await Promise.all((r.result ?? []).map(async (p: any) => {
     const full = (await cs<any>("GET", `/api/device-profiles/${p.id}`)).deviceProfile;
     const meas = Object.values(full.measurements ?? {}).map((m: any) => ({ name: m.name, unit: "" }));
     return { id: p.id, name: p.name, region: full.region, lorawanVersion: full.macVersion, class: full.supportsClassC ? "C" : "A", measurements: meas, hasDecoder: Boolean(full.payloadCodecScript), description: full.description ?? "" };
   }));
+  typeCache.set(org.tenantId, { items, at: Date.now() });
   return c.json({ items });
 });
 // Starter decoder for custom/DIY devices: passes raw bytes through so the
@@ -451,6 +462,7 @@ app.post("/device-types", async (c) => {
       payloadCodecRuntime: "JS",
       payloadCodecScript: decoder || STARTER_DECODER,
     } });
+    typeCache.delete(org.tenantId);   // new type -> next read rebuilds
     return c.json({ id: r.id, name: body.name, region: body.region ?? "US915", lorawanVersion: macVersion, class: body.class === "C" ? "C" : "A", measurements: [], hasDecoder: true });
   } catch (e) { return err400(c, e, "Could not create the device type"); }
 });
@@ -475,7 +487,7 @@ app.get("/devices/:eui", async (c) => {
   const eui = c.req.param("eui").toLowerCase();
   const d = await ownedDevice(eui, org);
   if (!d) return c.json({ error: "not found" }, 404);
-  const [latestMap, states] = await Promise.all([latestByEui(new Set([eui])), deviceStates()]);
+  const [latestMap, states] = await Promise.all([latestByEui(new Set([eui])), deviceStates(eui)]);
   const latest = latestMap[eui] ?? null;
   const st = states[eui] ?? {};
   let typeName = "";

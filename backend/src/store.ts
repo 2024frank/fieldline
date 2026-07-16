@@ -45,8 +45,18 @@ export function save() {
   const tmp = DATA_PATH + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
   fs.renameSync(tmp, DATA_PATH);
+  emailIndex = null;  // membership changed -> rebuild lazily
 }
 export const store = { get: load, save };
+
+// O(1) auth lookup. Every authenticated request resolves a user by email; a
+// linear array.find() is fine at 3 users and a hot loop at 30,000. The Map is
+// rebuilt lazily only when the user set actually changes (on save()).
+let emailIndex: Map<string, AppUser> | null = null;
+export function userByEmail(email: string): AppUser | undefined {
+  if (!emailIndex) emailIndex = new Map(load().users.map(u => [u.email, u]));
+  return emailIndex.get(email);
+}
 
 // ---- password + token hashing ----
 export function hashPassword(pw: string): string {

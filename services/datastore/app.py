@@ -19,27 +19,51 @@ MQTT_USER = os.environ.get("MQTT_USER", "chirpstack")
 MQTT_PASS = os.environ.get("MQTT_PASS", "")
 
 def db():
+    # Hot path: just a connection. Schema/DDL is done ONCE in init_db(), not on
+    # every request. (The old code ran 6 DDL statements per call — at scale that's
+    # tens of thousands of pointless catalog lookups per second.)
+    c = sqlite3.connect(DB, timeout=10)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")   # WAL-safe, much faster writes
+    return c
+
+def init_db():
     c = sqlite3.connect(DB, timeout=10)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("""CREATE TABLE IF NOT EXISTS readings(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         dev_eui TEXT, device TEXT, ts TEXT, f_cnt INTEGER,
         rssi INTEGER, snr REAL, data TEXT)""")
+    # Index carries id so latest/history queries are index-only (no table walk).
     c.execute("CREATE INDEX IF NOT EXISTS idx_dev ON readings(dev_eui, id)")
-    try:
-        c.execute("ALTER TABLE readings ADD COLUMN gw TEXT")  # which gateway heard it
-    except sqlite3.OperationalError:
-        pass  # column already there
-    # network events beyond data uplinks: joins, device status, errors
+    for stmt in ("ALTER TABLE readings ADD COLUMN gw TEXT",):
+        try: c.execute(stmt)
+        except sqlite3.OperationalError: pass
     c.execute("""CREATE TABLE IF NOT EXISTS events(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         dev_eui TEXT, kind TEXT, ts TEXT, code TEXT, detail TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ev ON events(dev_eui, id)")
-    try:
-        c.execute("ALTER TABLE events ADD COLUMN level TEXT")
-    except sqlite3.OperationalError:
-        pass
-    return c
+    # Partial-ish helper index for the per-(device,kind) latest lookup in /state.
+    c.execute("CREATE INDEX IF NOT EXISTS idx_ev_kind ON events(dev_eui, kind, id)")
+    for stmt in ("ALTER TABLE events ADD COLUMN level TEXT",):
+        try: c.execute(stmt)
+        except sqlite3.OperationalError: pass
+    # "Latest reading per device" is a dashboard staple. Computing it from the
+    # firehose is either a full GROUP BY scan (slow) or a bounded LIMIT window
+    # (drops quiet devices). Both are wrong at scale. Instead we MAINTAIN it:
+    # one row per device, upserted on write. Reads become O(devices), not O(rows).
+    c.execute("""CREATE TABLE IF NOT EXISTS latest(
+        dev_eui TEXT PRIMARY KEY, device TEXT, ts TEXT,
+        rssi INTEGER, snr REAL, data TEXT, gw TEXT, src_id INTEGER)""")
+    # Backfill once so existing data appears. Prefer newest-with-data, else newest.
+    HAS = "data IS NOT NULL AND data <> '' AND data <> '{}'"
+    c.execute(f"""INSERT OR IGNORE INTO latest(dev_eui,device,ts,rssi,snr,data,gw,src_id)
+        SELECT r.dev_eui,r.device,r.ts,r.rssi,r.snr,r.data,r.gw,r.id FROM readings r
+        JOIN (SELECT dev_eui, MAX(id) mid FROM readings WHERE {HAS} GROUP BY dev_eui) g ON r.id=g.mid""")
+    c.execute("""INSERT OR IGNORE INTO latest(dev_eui,device,ts,rssi,snr,data,gw,src_id)
+        SELECT r.dev_eui,r.device,r.ts,r.rssi,r.snr,r.data,r.gw,r.id FROM readings r
+        JOIN (SELECT dev_eui, MAX(id) mid FROM readings GROUP BY dev_eui) g ON r.id=g.mid""")
+    c.commit(); c.close()
 
 def rowdict(r):
     if not r: return {}
@@ -62,10 +86,20 @@ def on_message(client, userdata, msg):
         c = db()
         if kind == "up":
             rx = (e.get("rxInfo") or [{}])[0]
-            c.execute("INSERT INTO readings(dev_eui,device,ts,f_cnt,rssi,snr,data,gw) VALUES(?,?,?,?,?,?,?,?)",
-                      (eui, di.get("deviceName"), e.get("time"), e.get("fCnt"),
-                       rx.get("rssi"), rx.get("snr"), json.dumps(e.get("object") or {}),
-                       (rx.get("gatewayId") or "").lower() or None))
+            data_str = json.dumps(e.get("object") or {})
+            gw = (rx.get("gatewayId") or "").lower() or None
+            cur = c.execute("INSERT INTO readings(dev_eui,device,ts,f_cnt,rssi,snr,data,gw) VALUES(?,?,?,?,?,?,?,?)",
+                            (eui, di.get("deviceName"), e.get("time"), e.get("fCnt"),
+                             rx.get("rssi"), rx.get("snr"), data_str, gw))
+            # Maintain the latest table. A decoded frame always wins; an empty
+            # frame only fills a device we've never heard decoded data from.
+            vals = (eui, di.get("deviceName"), e.get("time"), rx.get("rssi"), rx.get("snr"), data_str, gw, cur.lastrowid)
+            if data_str not in ("", "{}"):
+                c.execute("""INSERT INTO latest(dev_eui,device,ts,rssi,snr,data,gw,src_id) VALUES(?,?,?,?,?,?,?,?)
+                    ON CONFLICT(dev_eui) DO UPDATE SET device=excluded.device, ts=excluded.ts,
+                      rssi=excluded.rssi, snr=excluded.snr, data=excluded.data, gw=excluded.gw, src_id=excluded.src_id""", vals)
+            else:
+                c.execute("INSERT OR IGNORE INTO latest(dev_eui,device,ts,rssi,snr,data,gw,src_id) VALUES(?,?,?,?,?,?,?,?)", vals)
         elif kind == "join":
             c.execute("INSERT INTO events(dev_eui,kind,ts,code,detail) VALUES(?,?,?,?,?)",
                       (eui, "join", e.get("time"), "JOIN", json.dumps({"devAddr": e.get("devAddr")})))
@@ -115,45 +149,46 @@ def readings():
         limit = min(int(request.args.get("limit") or 500), 2000)
     except ValueError:
         limit = 500
+    COLS = "SELECT dev_eui,device,ts,rssi,snr,data,gw FROM readings"
+    HAS_DATA = "data IS NOT NULL AND data <> '' AND data <> '{}'"
     c = db()
-    rows = c.execute("SELECT dev_eui,device,ts,rssi,snr,data,gw FROM readings ORDER BY id DESC LIMIT 5000").fetchall()
-    c.close()
-    allr = [rowdict(x) for x in rows]  # newest first
+    try:
+        # ── one device ──────────────────────────────────────────────────────
+        # WHERE dev_eui=? hits the (dev_eui,id) index directly: we touch only
+        # this device's rows, not the whole table.
+        if dev:
+            d = dev.lower()
+            if history or want_csv:
+                rows = c.execute(f"{COLS} WHERE dev_eui=? AND {HAS_DATA} ORDER BY id DESC LIMIT ?",
+                                 (d, limit)).fetchall()
+                hist = [rowdict(x) for x in rows]
+                if want_csv:
+                    cols = sorted({k for r in hist for k in r["data"].keys()})
+                    lines = ["time,rssi,snr," + ",".join(cols)]
+                    for r in hist:
+                        lines.append(",".join([str(r["time"]), str(r["rssi"] or ""), str(r["snr"] or "")] +
+                                              [str(r["data"].get(k, "")) for k in cols]))
+                    from flask import Response
+                    return Response("\n".join(lines) + "\n", mimetype="text/csv",
+                                    headers={"Content-Disposition": f"attachment; filename={d}.csv"})
+                return jsonify(hist)
+            # latest for one device: prefer newest decoded, else newest anything.
+            row = c.execute(f"{COLS} WHERE dev_eui=? AND {HAS_DATA} ORDER BY id DESC LIMIT 1", (d,)).fetchone() \
+                  or c.execute(f"{COLS} WHERE dev_eui=? ORDER BY id DESC LIMIT 1", (d,)).fetchone()
+            return jsonify(rowdict(row) if row else {})
 
-    if dev:
-        d = dev.lower()
-        drows = [r for r in allr if r["devEui"] == d]
+        # ── latest per device ───────────────────────────────────────────────
+        # Read the maintained table: one row per device, O(devices). No scan of
+        # the firehose regardless of how many billions of rows sit behind it.
+        if latest:
+            rows = c.execute("SELECT dev_eui,device,ts,rssi,snr,data,gw FROM latest").fetchall()
+            return jsonify([rowdict(x) for x in rows])
 
-        # full history for one device (list), newest first
-        if history or want_csv:
-            hist = [r for r in drows if r["data"]][:limit]
-            if want_csv:
-                cols = sorted({k for r in hist for k in r["data"].keys()})
-                lines = ["time,rssi,snr," + ",".join(cols)]
-                for r in hist:
-                    lines.append(",".join([str(r["time"]), str(r["rssi"] or ""), str(r["snr"] or "")] +
-                                          [str(r["data"].get(k, "")) for k in cols]))
-                from flask import Response
-                return Response("\n".join(lines) + "\n", mimetype="text/csv",
-                                headers={"Content-Disposition": f"attachment; filename={d}.csv"})
-            return jsonify(hist)
-
-        # prefer the newest reading that actually has decoded values;
-        # some sensors send occasional empty "event" frames
-        chosen = next((r for r in drows if r["data"]), (drows[0] if drows else None))
-        return jsonify(chosen or {})
-
-    if latest:
-        newest, withdata = {}, {}
-        for r in allr:  # newest first
-            e = r["devEui"]
-            newest.setdefault(e, r)
-            if r["data"]:
-                withdata.setdefault(e, r)
-        result = [withdata.get(e, newest[e]) for e in newest]
-        return jsonify(result)
-
-    return jsonify(allr[:100])
+        # ── recent (debug) ──────────────────────────────────────────────────
+        rows = c.execute(f"{COLS} ORDER BY id DESC LIMIT 100").fetchall()
+        return jsonify([rowdict(x) for x in rows])
+    finally:
+        c.close()
 
 @app.get("/events")
 def events():
@@ -163,42 +198,46 @@ def events():
         limit = min(int(request.args.get("limit") or 50), 500)
     except ValueError:
         limit = 50
+    where, params = [], []
+    if dev:  where.append("dev_eui=?"); params.append(dev.lower())
+    if kind: where.append("kind=?");   params.append(kind)
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
     c = db()
-    rows = c.execute("SELECT dev_eui,kind,ts,code,detail,level FROM events ORDER BY id DESC LIMIT 2000").fetchall()
-    c.close()
-    out = []
-    for r in rows:
-        if dev and r[0] != dev.lower():
-            continue
-        if kind and r[1] != kind:
-            continue
-        out.append({"devEui": r[0], "kind": r[1], "time": r[2], "code": r[3], "detail": r[4], "level": r[5] if len(r) > 5 else None})
-        if len(out) >= limit:
-            break
-    return jsonify(out)
+    try:
+        rows = c.execute(f"SELECT dev_eui,kind,ts,code,detail,level FROM events{clause} ORDER BY id DESC LIMIT ?",
+                         (*params, limit)).fetchall()
+    finally:
+        c.close()
+    return jsonify([{"devEui": r[0], "kind": r[1], "time": r[2], "code": r[3], "detail": r[4], "level": r[5]}
+                    for r in rows])
 
 @app.get("/state")
 def state():
-    """Latest join / battery / error per device, folded from the events log."""
+    """Latest join / battery / error per device, folded from the events log.
+    One grouped index scan gets the newest id per (device, kind); then one fetch.
+    Optional ?device= limits it to a single sensor (used by the detail page)."""
+    dev = request.args.get("device")
+    dclause, dparams = (" WHERE dev_eui=?", (dev.lower(),)) if dev else ("", ())
     c = db()
-    rows = c.execute("SELECT dev_eui,kind,ts,code,detail,level FROM events ORDER BY id DESC LIMIT 3000").fetchall()
-    c.close()
+    try:
+        ids = [r[0] for r in c.execute(
+            f"SELECT MAX(id) FROM events{dclause} GROUP BY dev_eui, kind", dparams).fetchall()]
+        if not ids:
+            return jsonify({})
+        ph = ",".join("?" * len(ids))
+        rows = c.execute(f"SELECT dev_eui,kind,ts,code,detail,level FROM events WHERE id IN ({ph}) ORDER BY id DESC",
+                         ids).fetchall()
+    finally:
+        c.close()
     out = {}
-    for row in rows:  # newest first
-        dev_eui, kind, ts, code, detail = row[0], row[1], row[2], row[3], row[4]
-        level = row[5] if len(row) > 5 else None
+    for dev_eui, kind, ts, code, detail, level in rows:  # newest first
         s = out.setdefault(dev_eui, {})
         if kind == "join" and "lastJoinAt" not in s:
             s["lastJoinAt"] = ts
         elif kind == "status" and "battery" not in s:
-            try:
-                d = json.loads(detail or "{}")
-            except ValueError:
-                d = {}
-            s["battery"] = d.get("battery")
-            s["margin"] = d.get("margin")
-            s["extPower"] = d.get("extPower")
-            s["lastStatusAt"] = ts
+            try: d = json.loads(detail or "{}")
+            except ValueError: d = {}
+            s.update(battery=d.get("battery"), margin=d.get("margin"), extPower=d.get("extPower"), lastStatusAt=ts)
         elif kind == "log" and "lastError" not in s:
             s["lastError"] = {"code": code, "description": detail, "time": ts, "level": level}
     return jsonify(out)
@@ -208,5 +247,6 @@ def health():
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
+    init_db()                                   # schema once, not per request
     threading.Thread(target=mqtt_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8000)
