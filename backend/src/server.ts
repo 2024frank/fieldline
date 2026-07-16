@@ -23,12 +23,18 @@ const app = new Hono();
 app.use("*", cors());
 
 // ---------- org (tenant) context ----------
+// The platform's original tenant: source of the sensor-type catalog and home
+// of legacy org-less records. Pin via env; otherwise the OLDEST tenant wins
+// (never "first in the list" — that reorders alphabetically as orgs are added).
+const TEMPLATE_TENANT_ID = (process.env.TEMPLATE_TENANT_ID ?? "").trim();
 let defaultTenantCache: { id: string; at: number } | null = null;
 async function defaultTenant(): Promise<string> {
+  if (TEMPLATE_TENANT_ID) return TEMPLATE_TENANT_ID;
   if (defaultTenantCache && Date.now() - defaultTenantCache.at < 300_000) return defaultTenantCache.id;
-  const t = (await cs<any>("GET", "/api/tenants?limit=1")).result[0];
-  defaultTenantCache = { id: t.id, at: Date.now() };
-  return t.id;
+  const list: any[] = (await cs<any>("GET", "/api/tenants?limit=100")).result ?? [];
+  list.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+  defaultTenantCache = { id: list[0].id, at: Date.now() };
+  return list[0].id;
 }
 type Org = { tenantId: string; tenantName: string; appId: string };
 const orgCache = new Map<string, { org: Org; at: number }>();
