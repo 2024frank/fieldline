@@ -76,6 +76,10 @@ These cost real hours on a real roof; the platform now handles or documents all 
 
 More field notes: [chirpstack-deploy](https://github.com/2024frank/chirpstack-deploy).
 
+## Scaling
+
+This repo is the single-node MVP. [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md) is the design brief for the production-grade platform it grows into — planes split, stateless API tier, TimescaleDB with continuous aggregates, queue-decoupled ingestion — with capacity math and a step-by-step roadmap. Reference implementations of the scaling-critical pieces (schema, cache, ingestion worker, scaled topology) are in [docs/architecture/reference/](docs/architecture/reference/).
+
 ## Bring your own hardware
 
 Any LoRaWAN device can join — define a custom device type with your own payload decoder in the UI. See [docs/CUSTOM-DEVICES.md](docs/CUSTOM-DEVICES.md) for what DIY devices need (DevEUI/JoinEUI/AppKey, US915 sub-band 2), a radio-module cheat sheet (Wio-E5, Digi XBee LR, RFM95+LMIC), and a complete EnviroDIY Mayfly dissolved-oxygen example with payload spec and decoder.

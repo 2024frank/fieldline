@@ -1,0 +1,79 @@
+# Production topology (single-region reference).
+#
+# The MVP was one docker-compose on one droplet. This is the same shape grown up:
+# the API tier is replicated and stateless (all shared state in Postgres/Redis),
+# ingestion and webhook delivery are their own worker pools, and the data stores
+# are the managed/clustered versions. In real production these become managed
+# services (RDS/Timescale Cloud, ElastiCache, MSK/NATS) — this file is the
+# self-hosted equivalent for staging and for understanding the pieces.
+
+services:
+  # Edge: TLS termination, routing, static caching. In prod this is a CDN + ALB.
+  edge:
+    image: caddy:2
+    ports: ["443:443", "80:80"]
+    volumes: ["./Caddyfile:/etc/caddy/Caddyfile"]
+    depends_on: [api]
+
+  # Stateless API tier — scale with `--scale api=N`. No local state.
+  api:
+    build: ../backend
+    deploy:
+      replicas: 3
+      resources: { limits: { cpus: "1", memory: 512M } }
+    environment:
+      - DATABASE_URL=postgres://fieldline:${DB_PASS}@postgres:5432/fieldline
+      - REDIS_URL=redis://redis:6379
+      - NATS_URL=nats://nats:4222
+      - JWT_SECRET=${JWT_SECRET}
+    depends_on: [postgres, redis, nats]
+
+  # Telemetry ingestion — batched writes to Timescale. Scale independently of API.
+  ingest:
+    build: { context: ../ingestion }
+    command: node ingest-worker.js
+    deploy: { replicas: 2 }
+    environment:
+      - DATABASE_URL=postgres://fieldline:${DB_PASS}@postgres:5432/fieldline
+      - REDIS_URL=redis://redis:6379
+      - NATS_URL=nats://nats:4222
+    depends_on: [postgres, redis, nats]
+
+  # Webhook delivery — retries/backoff isolated from ingestion.
+  webhooks:
+    build: { context: ../ingestion }
+    command: node webhook-worker.js
+    deploy: { replicas: 2 }
+    environment: [REDIS_URL=redis://redis:6379]
+    depends_on: [redis]
+
+  postgres:                       # control plane + TimescaleDB telemetry
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      - POSTGRES_DB=fieldline
+      - POSTGRES_USER=fieldline
+      - POSTGRES_PASSWORD=${DB_PASS}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    command: ["postgres", "-c", "shared_buffers=1GB", "-c", "max_connections=200"]
+
+  redis:                          # cache · rate limits · idempotency · webhook stream
+    image: redis:7-alpine
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+
+  nats:                           # durable ingestion log (JetStream)
+    image: nats:2-alpine
+    command: ["-js"]
+
+  # LoRaWAN network server — the plane that speaks to gateways/sensors.
+  chirpstack:
+    image: chirpstack/chirpstack:4
+    depends_on: [postgres, redis, mosquitto]
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports: ["1883:1883"]
+
+volumes:
+  pgdata:
