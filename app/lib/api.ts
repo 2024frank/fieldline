@@ -74,6 +74,8 @@ export const api = {
   },
   readingsCsvUrl: (eui: string, from?: string, to?: string) => `${API_BASE}/devices/${eui}/readings.csv?${new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) })}`,
   setReportingInterval: (eui: string, minutes: number) => request<{ queued: true; note: string }>(`/devices/${eui}/commands/reporting-interval`, { method: "POST", body: JSON.stringify({ minutes }) }),
+  commands: (eui: string) => request<List<{ id: string; label: string; description: string; disruptive?: boolean }>>(`/devices/${eui}/commands`),
+  sendCommand: (eui: string, command: string) => request<{ queued: true; note: string }>(`/devices/${eui}/command`, { method: "POST", body: JSON.stringify({ command }) }),
   alerts: () => request<List<Alert>>("/alerts"),
   tokens: () => request<List<ApiToken>>("/tokens"),
   createToken: (name: string) => request<ApiToken>("/tokens", { method: "POST", body: JSON.stringify({ name }) }),

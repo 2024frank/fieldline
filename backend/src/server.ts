@@ -564,6 +564,55 @@ app.get("/devices/:eui/readings.csv", async (c) => {
 });
 
 // ---------- downlink commands ----------
+// Real command bytes from Milesight's own encoder scripts (SensorDecoders repo).
+// Classic AM/CT/EM/WS use channel 0xff; the newer GS series uses single-byte codes.
+type Command = { id: string; label: string; description: string; fPort: number; bytes: string; disruptive?: boolean };
+function commandsFor(typeName: string): Command[] {
+  const n = (typeName || "").toLowerCase();
+  const cmds: Command[] = [];
+  if (n.includes("gs601") || /\bgs\d/.test(n)) {
+    cmds.push({ id: "buzzer", label: "Sound the buzzer", description: "Beeps the detector once — a live proof it's working and reachable.", fPort: 85, bytes: "1101" });
+    cmds.push({ id: "led_on", label: "LED on", description: "Turn the status light on.", fPort: 85, bytes: "6201" });
+    cmds.push({ id: "led_off", label: "LED off", description: "Turn the status light off.", fPort: 85, bytes: "6200" });
+    cmds.push({ id: "reboot", label: "Reboot", description: "Restart the device.", fPort: 85, bytes: "be", disruptive: true });
+    return cmds;
+  }
+  if (n.includes("milesight")) {
+    if (n.includes(" am") || n.startsWith("milesight am")) {
+      cmds.push({ id: "screen_on", label: "Screen on", description: "Turn the display on.", fPort: 85, bytes: "ff2d01" });
+      cmds.push({ id: "screen_off", label: "Screen off", description: "Turn the display off.", fPort: 85, bytes: "ff2d00" });
+    }
+    cmds.push({ id: "reboot", label: "Reboot", description: "Restart the sensor. It rejoins on its own.", fPort: 85, bytes: "ff10ff", disruptive: true });
+    return cmds;
+  }
+  return cmds; // custom/DIY device: no vendor command set known
+}
+app.get("/devices/:eui/commands", async (c) => {
+  const org = await orgOf(authUser(c)!);
+  const eui = c.req.param("eui").toLowerCase();
+  const d = await ownedDevice(eui, org);
+  if (!d) return c.json({ error: "not found" }, 404);
+  let typeName = "";
+  try { typeName = (await cs<any>("GET", `/api/device-profiles/${d.device.deviceProfileId}`)).deviceProfile.name; } catch { /* optional */ }
+  return c.json({ items: commandsFor(typeName).map(({ bytes, fPort, ...rest }) => rest) });
+});
+app.post("/devices/:eui/command", async (c) => {
+  const me = authUser(c)!;
+  if (me.role === "viewer") return c.json({ error: "Viewers can't send commands" }, 403);
+  const org = await orgOf(me);
+  const eui = c.req.param("eui").toLowerCase();
+  const d = await ownedDevice(eui, org);
+  if (!d) return c.json({ error: "not found" }, 404);
+  const { command } = await c.req.json();
+  let typeName = "";
+  try { typeName = (await cs<any>("GET", `/api/device-profiles/${d.device.deviceProfileId}`)).deviceProfile.name; } catch { /* optional */ }
+  const cmd = commandsFor(typeName).find(x => x.id === command);
+  if (!cmd) return c.json({ error: "unknown command for this device type" }, 400);
+  try {
+    await cs("POST", `/api/devices/${eui}/queue`, { queueItem: { fPort: cmd.fPort, confirmed: false, data: Buffer.from(cmd.bytes, "hex").toString("base64") } });
+    return c.json({ queued: true, note: `"${cmd.label}" queued. A low-power sensor applies it at its next check-in (up to one reporting interval).` });
+  } catch (e) { return err400(c, e, "Could not queue the command"); }
+});
 app.post("/devices/:eui/commands/reporting-interval", async (c) => {
   try {
     const org = await orgOf(authUser(c)!);
