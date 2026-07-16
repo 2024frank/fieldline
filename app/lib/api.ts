@@ -72,7 +72,15 @@ export const api = {
     Object.entries(params).forEach(([key, value]) => value != null && query.set(key, String(value)));
     return request<List<Reading>>(`/devices/${eui}/readings?${query}`);
   },
-  readingsCsvUrl: (eui: string, from?: string, to?: string) => `${API_BASE}/devices/${eui}/readings.csv?${new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) })}`,
+  // Authenticated blob download — the CSV endpoint now requires a session, so we
+  // fetch it with the token instead of linking to a bare URL.
+  downloadReadingsCsv: async (eui: string, from?: string, to?: string) => {
+    const token = authToken();
+    const q = new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) });
+    const r = await fetch(`${API_BASE}/devices/${eui}/readings.csv?${q}`, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    if (!r.ok) throw new ApiError("Export failed", r.status);
+    return r.blob();
+  },
   setReportingInterval: (eui: string, minutes: number) => request<{ queued: true; note: string }>(`/devices/${eui}/commands/reporting-interval`, { method: "POST", body: JSON.stringify({ minutes }) }),
   commands: (eui: string) => request<List<{ id: string; label: string; description: string; disruptive?: boolean }>>(`/devices/${eui}/commands`),
   sendCommand: (eui: string, command: string) => request<{ queued: true; note: string }>(`/devices/${eui}/command`, { method: "POST", body: JSON.stringify({ command }) }),

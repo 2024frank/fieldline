@@ -1,9 +1,9 @@
-// Onboarding email via Resend (MAIL_FROM domain must be verified in Resend).
+// Onboarding email via Resend (yourdomain.com is a verified sending domain).
 // Templates are table-based with inline styles so they render correctly in
 // Gmail, Outlook, and Apple Mail. Logo is a hosted PNG (email clients don't
 // render SVG).
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
-const MAIL_FROM = process.env.MAIL_FROM ?? "Fieldline <fieldline@yourdomain.com>";
+const MAIL_FROM = process.env.MAIL_FROM ?? "Fieldline <your-app-domain>";
 const APP_URL = process.env.APP_URL ?? "https://your-app-domain";
 const LOGO_URL = `${APP_URL}/logo-email.png`;
 
@@ -22,6 +22,10 @@ export async function sendMail(to: string, subject: string, html: string, text: 
 }
 
 const F = "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+// Escape user-controlled fields (org name, person name) before they enter HTML,
+// so a crafted org name can't inject markup/links into onboarding emails.
+const esc = (s: string) => String(s ?? "").replace(/[&<>"']/g, ch =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]!));
 
 function shell(inner: string, recipientEmail: string): string {
   return `<!doctype html>
@@ -49,7 +53,7 @@ function shell(inner: string, recipientEmail: string): string {
     <tr><td align="center" style="padding:24px 20px 0;">
       <div style="${F}font-size:12px;line-height:19px;color:#93a29a;">
         Fieldline &middot; Private LoRaWAN sensor networks for schools and campuses<br/>
-        You're receiving this because an administrator created a Fieldline account for ${recipientEmail}.
+        You're receiving this because an administrator created a Fieldline account for ${esc(recipientEmail)}.
       </div>
     </td></tr>
 
@@ -67,8 +71,8 @@ function credentialRows(email: string, password: string): string {
   return `
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f6f9f7" style="background-color:#f6f9f7;border:1px solid #e2e8e3;border-radius:12px;margin:24px 0;">
     ${row("Sign-in address", `<a href="${APP_URL}" style="color:#0f8a57;text-decoration:none;">${APP_URL.replace("https://", "")}</a>`)}
-    ${row("Email", email)}
-    ${row("Temporary password", password, true, true)}
+    ${row("Email", esc(email))}
+    ${row("Temporary password", esc(password), true, true)}
   </table>`;
 }
 
@@ -93,18 +97,18 @@ export function welcomeOrgEmail(p: { orgName: string; name: string; email: strin
   const subject = `Your ${p.orgName} workspace is ready`;
   const html = shell(`
     <h1 style="${F}margin:0 0 14px;font-size:22px;line-height:30px;font-weight:700;color:#0d1c14;letter-spacing:-0.3px;">
-      ${p.orgName} is ready on Fieldline</h1>
+      ${esc(p.orgName)} is ready on Fieldline</h1>
     <p style="${F}margin:0;font-size:15px;line-height:24px;color:#41504a;">
-      Hi ${p.name},</p>
+      Hi ${esc(p.name)},</p>
     <p style="${F}margin:14px 0 0;font-size:15px;line-height:24px;color:#41504a;">
-      A private sensor-network workspace for <strong>${p.orgName}</strong> has been created, with you as its administrator.
+      A private sensor-network workspace for <strong>${esc(p.orgName)}</strong> has been created, with you as its administrator.
       From one console you can connect gateways, add sensors with step-by-step setup guides, watch live readings, and route data to any system you use.</p>
     ${credentialRows(p.email, p.tempPassword)}
     ${ctaButton("Sign in to Fieldline")}
     ${securityNote}`, p.email);
   const text = `${p.orgName} is ready on Fieldline
 
-Hi ${p.name},
+Hi ${esc(p.name)},
 
 A private sensor-network workspace for ${p.orgName} has been created, with you as its administrator.
 
@@ -125,7 +129,7 @@ export function operatorEmail(p: { name: string; email: string; tempPassword?: s
     <h1 style="${F}margin:0 0 14px;font-size:22px;line-height:30px;font-weight:700;color:#0d1c14;letter-spacing:-0.3px;">
       Welcome to the operator team</h1>
     <p style="${F}margin:0;font-size:15px;line-height:24px;color:#41504a;">
-      Hi ${p.name},</p>
+      Hi ${esc(p.name)},</p>
     <p style="${F}margin:14px 0 0;font-size:15px;line-height:24px;color:#41504a;">
       You've been made a <strong>platform operator</strong> on Fieldline. Operators onboard new organizations:
       you fill in a school's name and contact, and the platform builds their private workspace and sends them their login.</p>
@@ -138,7 +142,7 @@ export function operatorEmail(p: { name: string; email: string; tempPassword?: s
     ${p.tempPassword ? securityNote : ""}`, p.email);
   const text = `Welcome to the operator team
 
-Hi ${p.name},
+Hi ${esc(p.name)},
 
 You've been made a platform operator on Fieldline. Operators onboard new organizations: you fill in a school's name and contact, and the platform builds their private workspace and sends them their login.
 
@@ -151,17 +155,17 @@ export function addedUserEmail(p: { orgName: string; name: string; email: string
   const subject = `You've been added to ${p.orgName} on Fieldline`;
   const html = shell(`
     <h1 style="${F}margin:0 0 14px;font-size:22px;line-height:30px;font-weight:700;color:#0d1c14;letter-spacing:-0.3px;">
-      Welcome to ${p.orgName}</h1>
+      Welcome to ${esc(p.orgName)}</h1>
     <p style="${F}margin:0;font-size:15px;line-height:24px;color:#41504a;">
-      Hi ${p.name},</p>
+      Hi ${esc(p.name)},</p>
     <p style="${F}margin:14px 0 0;font-size:15px;line-height:24px;color:#41504a;">
-      You've been given <strong>${p.role}</strong> access to ${p.orgName}'s sensor network on Fieldline — live readings, device status, and data tools in one console.</p>
+      You've been given <strong>${esc(p.role)}</strong> access to ${p.orgName}'s sensor network on Fieldline — live readings, device status, and data tools in one console.</p>
     ${credentialRows(p.email, p.tempPassword)}
     ${ctaButton("Sign in to Fieldline")}
     ${securityNote}`, p.email);
   const text = `Welcome to ${p.orgName}
 
-Hi ${p.name},
+Hi ${esc(p.name)},
 
 You've been given ${p.role} access to ${p.orgName}'s sensor network on Fieldline.
 

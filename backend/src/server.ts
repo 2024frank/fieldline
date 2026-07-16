@@ -5,6 +5,7 @@
 // catalog, and provisions the first admin user with a temporary password.
 import "dotenv/config";
 import crypto from "node:crypto";
+import { lookup } from "node:dns/promises";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -20,7 +21,43 @@ const PUBLIC_HOST = process.env.PUBLIC_HOST ?? "your.server.ip";
 const PLATFORM_ADMINS = (process.env.PLATFORM_ADMINS ?? "admin").split(",").map(s => s.trim().toLowerCase());
 
 const app = new Hono();
-app.use("*", cors());
+// Browser CORS restricted to our own front-ends. The public data API is
+// machine-to-machine (x-api-key), so it isn't affected by this.
+const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS ??
+  "https://your-app-domain,https://your-admin-domain,https://fieldline-tau.vercel.app,https://your-admin-domain,http://localhost:3000,http://localhost:3100").split(",");
+app.use("*", cors({ origin: (o) => (o && ALLOWED_ORIGINS.includes(o) ? o : ""), credentials: false }));
+
+// ── brute-force throttle (per-node; Redis-backed at multi-node, see ARCHITECTURE) ──
+const attempts = new Map<string, { n: number; reset: number }>();
+function throttle(key: string, max: number, windowMs: number): boolean {
+  const now = Date.now(); const e = attempts.get(key);
+  if (!e || now > e.reset) { attempts.set(key, { n: 1, reset: now + windowMs }); return true; }
+  e.n++; return e.n <= max;
+}
+function clientIp(c: any): string { return (c.req.header("x-forwarded-for") ?? "").split(",")[0].trim() || "unknown"; }
+
+// ── SSRF guard: a webhook may only target a public host, never internal
+// services (chirpstack, postgres, redis) or the cloud metadata endpoint ──
+function isPrivateIp(ip: string): boolean {
+  const p = ip.replace(/^::ffff:/, "");
+  if (/^(127\.|10\.|169\.254\.|0\.)/.test(p)) return true;              // loopback, private-A, link-local (metadata), this-net
+  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(p)) return true;  // CGNAT 100.64/10
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(p)) return true;               // private-B
+  if (/^192\.168\./.test(p)) return true;                              // private-C
+  if (p === "::1" || /^f[cd]/i.test(p) || /^fe80/i.test(p)) return true; // v6 loopback/ULA/link-local
+  return false;
+}
+async function assertPublicUrl(raw: string): Promise<void> {
+  let u: URL;
+  try { u = new URL(raw); } catch { throw new Error("Enter a valid http(s) URL"); }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("Only http(s) endpoints are allowed");
+  const host = u.hostname.replace(/^\[|\]$/g, "");
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(":")) {
+    if (isPrivateIp(host)) throw new Error("That endpoint points to an internal address and is blocked");
+  }
+  const addrs = await lookup(host, { all: true }).catch(() => { throw new Error("Could not resolve that host"); });
+  for (const a of addrs) if (isPrivateIp(a.address)) throw new Error("That endpoint resolves to an internal address and is blocked");
+}
 
 // ---------- org (tenant) context ----------
 // The platform's original tenant: source of the sensor-type catalog and home
@@ -87,6 +124,9 @@ function pub(u: AppUser) { return { id: u.id, name: u.name, email: u.email, role
 app.post("/auth/login", async (c) => {
   const { email, password } = await c.req.json();
   const norm = String(email ?? "").trim().toLowerCase();
+  // Throttle brute-force / credential-stuffing: 8 tries per 5 min per (ip,email).
+  if (!throttle(`login:${clientIp(c)}:${norm}`, 8, 5 * 60_000))
+    return c.json({ error: "Too many sign-in attempts. Wait a few minutes and try again." }, 429);
   const db = store.get();
   let user = db.users.find(u => u.email === norm);
   if (user?.passwordHash) {
@@ -161,8 +201,19 @@ app.get("/public/readings", async (c) => {
 // ---------- guard everything below ----------
 app.use("/*", async (c, next) => {
   const p = c.req.path;
-  if (p.startsWith("/auth") || p === "/health" || p.startsWith("/public") || p.endsWith("/readings.csv")) return next();
-  if (!authUser(c)) return c.json({ error: "unauthorized" }, 401);
+  // Only login, health, and the token-authed public API are open. Everything
+  // else — including CSV export — requires a valid session.
+  if (p === "/auth/login" || p === "/health" || p.startsWith("/public")) return next();
+  const u = authUser(c);
+  if (!u) return c.json({ error: "unauthorized" }, 401);
+  // Forced password change is enforced HERE, not just in the UI: a temporary
+  // password can't be used to drive the API until it's replaced.
+  const okDuringChange = p === "/auth/change-password" || p === "/auth/me" || p === "/auth/logout" || p === "/auth/onboarding";
+  if (u.mustChangePassword && !okDuringChange)
+    return c.json({ error: "Change your temporary password before continuing." }, 403);
+  // Viewers are strictly read-only.
+  if (u.role === "viewer" && c.req.method !== "GET" && p !== "/auth/change-password" && p !== "/auth/logout")
+    return c.json({ error: "Your account has read-only access." }, 403);
   return next();
 });
 
@@ -568,7 +619,11 @@ app.get("/devices/:eui/readings", async (c) => {
 });
 // CSV export rides an <a href> (no auth header) — reachable by EUI only.
 app.get("/devices/:eui/readings.csv", async (c) => {
+  // Authenticated (via the guard) AND scoped to the caller's org — you can only
+  // export a sensor you own, not any EUI you can guess.
+  const org = await orgOf(authUser(c)!);
   const eui = c.req.param("eui").toLowerCase();
+  if (!(await orgEuis(org.appId)).has(eui)) return c.json({ error: "not found" }, 404);
   const r = await fetch(`${READINGS_URL}?device=${eui}&csv=1&limit=2000`);
   c.header("Content-Type", "text/csv");
   c.header("Content-Disposition", `attachment; filename=${eui}.csv`);
@@ -676,7 +731,9 @@ app.get("/tokens", async (c) => {
   return c.json({ items });
 });
 app.post("/tokens", async (c) => {
-  const org = await orgOf(authUser(c)!);
+  const me = authUser(c)!;
+  if (me.role !== "admin") return c.json({ error: "Only admins can create API tokens" }, 403);
+  const org = await orgOf(me);
   const { name } = await c.req.json();
   const value = `flt_${randomHex(24)}`;
   const t = { id: randomId(), name: name || "API token", hash: sha256(value), prefix: value.slice(0, 8), createdAt: new Date().toISOString(), lastUsedAt: null, orgId: org.tenantId };
@@ -684,7 +741,9 @@ app.post("/tokens", async (c) => {
   return c.json({ id: t.id, name: t.name, createdAt: t.createdAt, lastUsedAt: null, token: value });
 });
 app.delete("/tokens/:id", async (c) => {
-  const org = await orgOf(authUser(c)!);
+  const me = authUser(c)!;
+  if (me.role !== "admin") return c.json({ error: "Only admins can revoke API tokens" }, 403);
+  const org = await orgOf(me);
   const dflt = await defaultTenant();
   const db = store.get();
   db.tokens = db.tokens.filter(t => !(t.id === c.req.param("id") && (t.orgId ?? dflt) === org.tenantId)); save();
@@ -712,7 +771,7 @@ app.post("/integrations", async (c) => {
   const org = await orgOf(authUser(c)!);
   const b = await c.req.json();
   if (b.type !== "webhook") return c.json({ error: "Webhook delivery is live today; other destination types are on the roadmap." }, 400);
-  if (!/^https?:\/\//.test(b.endpoint ?? "")) return c.json({ error: "Enter a valid http(s) endpoint" }, 400);
+  try { await assertPublicUrl(b.endpoint ?? ""); } catch (e) { return c.json({ error: (e as Error).message }, 400); }
   const i = {
     id: randomId(), name: b.name, type: b.type, endpoint: b.endpoint, authType: b.authType ?? "none",
     orgId: org.tenantId,
@@ -744,14 +803,15 @@ async function deliver(i: any, payload: object): Promise<{ ok: boolean; status: 
   const body = JSON.stringify(payload);
   const t0 = Date.now();
   try {
-    const r = await fetch(i.endpoint, { method: "POST", headers: authHeaders(i, body), body, signal: AbortSignal.timeout(10_000) });
+    await assertPublicUrl(i.endpoint);   // re-check at delivery too (guards DNS rebinding)
+    const r = await fetch(i.endpoint, { method: "POST", headers: authHeaders(i, body), body, redirect: "manual", signal: AbortSignal.timeout(10_000) });
     return { ok: r.ok, status: r.status, ms: Date.now() - t0 };
   } catch { return { ok: false, status: 0, ms: Date.now() - t0 }; }
 }
 app.post("/integrations/test", async (c) => {
   const b = await c.req.json();
   if (b.type && b.type !== "webhook") return c.json({ error: "Webhook delivery is live today; other destination types are on the roadmap." }, 400);
-  if (!/^https?:\/\//.test(b.endpoint ?? "")) return c.json({ error: "Enter a valid http(s) endpoint" }, 400);
+  try { await assertPublicUrl(b.endpoint ?? ""); } catch (e) { return c.json({ error: (e as Error).message }, 400); }
   const res = await deliver(b, { event: "integration.test", source: "fieldline", time: new Date().toISOString(), device: { eui: "24e124aabbccddee", name: "Sample sensor" }, measurements: { temperature: 22.5, humidity: 41.2 } });
   if (!res.ok) return c.json({ error: res.status ? `Endpoint answered HTTP ${res.status}` : "Endpoint unreachable (connection failed or timed out)" }, 400);
   return c.json({ ok: true, latencyMs: res.ms, message: `Endpoint answered HTTP ${res.status}` });
