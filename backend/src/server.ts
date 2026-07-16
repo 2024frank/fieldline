@@ -406,17 +406,40 @@ app.get("/device-types", async (c) => {
   }));
   return c.json({ items });
 });
+// Starter decoder for custom/DIY devices: passes raw bytes through so the
+// device shows up with SOMETHING, and documents how to write a real one.
+const STARTER_DECODER = `// ChirpStack v4 decoder. Return { data: {...} } — each key becomes a
+// measurement shown in Fieldline (e.g. temperature, do_ppm, battery).
+function decodeUplink(input) {
+  var b = input.bytes; // array of payload bytes from your device
+  return {
+    data: {
+      // EXAMPLE for a payload of [uint16 value*100, uint16 battery mV]:
+      // value: ((b[0] << 8) | b[1]) / 100,
+      // battery: (b[2] << 8) | b[3],
+      raw_first_byte: b.length ? b[0] : 0,
+      raw_length: b.length,
+    },
+  };
+}`;
 app.post("/device-types", async (c) => {
   try {
     const org = await orgOf(authUser(c)!);
     const body = await c.req.json();
+    const macMap: Record<string, string> = { "1.0.2": "LORAWAN_1_0_2", "1.0.3": "LORAWAN_1_0_3", "1.0.4": "LORAWAN_1_0_4", "1.1.0": "LORAWAN_1_1_0" };
+    const macVersion = macMap[body.lorawanVersion] ?? "LORAWAN_1_0_3";
+    const decoder = (body.decoderScript ?? "").trim();
+    if (decoder && !decoder.includes("decodeUplink")) return c.json({ error: "The decoder must define a decodeUplink(input) function" }, 400);
     const r = await cs<any>("POST", "/api/device-profiles", { deviceProfile: {
       name: body.name, tenantId: org.tenantId, region: body.region ?? "US915",
-      macVersion: "LORAWAN_1_0_3", regParamsRevision: "A",
-      supportsOtaa: true, uplinkInterval: 1200, adrAlgorithmId: "default",
-      description: "Created via Fieldline",
+      macVersion, regParamsRevision: macVersion === "LORAWAN_1_0_4" ? "RP002_1_0_3" : "A",
+      supportsOtaa: true, supportsClassC: body.class === "C",
+      uplinkInterval: 1200, adrAlgorithmId: "default",
+      description: body.description || "Custom device type created via Fieldline",
+      payloadCodecRuntime: "JS",
+      payloadCodecScript: decoder || STARTER_DECODER,
     } });
-    return c.json({ id: r.id, name: body.name, region: body.region ?? "US915", lorawanVersion: "LORAWAN_1_0_3", class: "A", measurements: [] });
+    return c.json({ id: r.id, name: body.name, region: body.region ?? "US915", lorawanVersion: macVersion, class: body.class === "C" ? "C" : "A", measurements: [], hasDecoder: true });
   } catch (e) { return err400(c, e, "Could not create the device type"); }
 });
 

@@ -85,6 +85,18 @@ export function SensorsPage() {
 function setupGuide(typeName: string) {
   const n = typeName.toLowerCase();
   if (!n) return null;
+  if (!n.includes("milesight")) return {
+    tool: "Your device's own setup method (USB serial, AT commands, or your firmware sketch)",
+    power: undefined as string | undefined,
+    note: "Custom payloads need a decoder so your bytes become named readings — set it on the Device types page. Until then readings arrive as raw bytes.",
+    steps: [
+      "Program the hardware ID you entered here into the device as its DevEUI — or read the module's factory DevEUI and register with that value instead.",
+      "Set the JoinEUI (AppEUI) to all zeros unless your module insists otherwise; it just has to be set.",
+      'Write the one-time key above into the module as the AppKey. Wio-E5 / LoRa-E5: AT+KEY=APPKEY,"<key>" · Digi XBee LR: paste it as the Application Key in XBee Studio · RFM95+LMIC: put it in your sketch.',
+      "Region US915 on sub-band 2 (channels 8-15). Wio-E5: AT+DR=US915 then AT+CH=NUM,8-15.",
+      "Join with OTAA (Wio-E5: AT+MODE=LWOTAA then AT+JOIN), send a test uplink, and watch it turn online on the Sensors page.",
+    ],
+  };
   const common = [
     "Confirm the hardware ID shown in the tool matches what you entered here — the tool's value wins over the sticker.",
     'Paste the one-time key above into Settings > LoRaWAN Settings > "Application Key", then press Write.',
@@ -133,10 +145,26 @@ export function SensorDetailPage({ eui }: { eui: string }) {
 }
 
 export function DeviceTypesPage() {
-  const query = useQuery({ queryKey: ["device-types"], queryFn: api.deviceTypes }); const [open, setOpen] = useState(false); const qc = useQueryClient(); const [name, setName] = useState("");
-  const create = useMutation({ mutationFn: () => api.createDeviceType({ name, region: "US915", lorawanVersion: "1.0.3", class: "A", measurements: [{ name: "temperature", unit: "°C" }] }), onSuccess: () => { qc.invalidateQueries({ queryKey: ["device-types"] }); setOpen(false); toast.success("Device type added"); } });
-  return <><PageHeader eyebrow="Catalog" title="Device types" description="Reusable definitions keep sensor setup, measurements, and network behavior consistent." action={<Button onClick={() => setOpen(true)}><Plus size={16}/>Add type</Button>}/>{query.isLoading ? <LoadingCards/> : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{query.data?.items.map(type => <Card key={type.id}><CardContent className="pt-5"><div className="flex items-start justify-between"><div className="rounded-xl bg-[var(--accent-soft)] p-3 text-[var(--accent)]"><Activity size={20}/></div><Badge tone="neutral">Class {type.class}</Badge></div><h2 className="mt-5 font-semibold">{type.name}</h2><p className="mt-1 text-sm text-[var(--muted)]">{type.region} · Network version {type.lorawanVersion}</p><div className="mt-5 flex flex-wrap gap-2">{type.measurements.map(m => <Badge key={m.name} tone="info">{formatMetric(m.name)} · {m.unit}</Badge>)}</div></CardContent></Card>)}</div>}{open && <Modal title="Add device type" body="Create a reusable definition for a supported sensor model." onClose={() => setOpen(false)}><div className="space-y-4"><Field label="Type name"><Input value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Water meter"/></Field><div className="grid grid-cols-2 gap-3"><Field label="Region"><Select><option>US915</option></Select></Field><Field label="Device class"><Select><option>A</option><option>C</option></Select></Field></div><Field label="Initial measurement"><Input value="temperature (°C)" readOnly/></Field><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => setOpen(false)}>Cancel</Button><Button disabled={!name || create.isPending} onClick={() => create.mutate()}>Add type</Button></div></div></Modal>}</>;
+  const query = useQuery({ queryKey: ["device-types"], queryFn: api.deviceTypes }); const [open, setOpen] = useState(false); const qc = useQueryClient();
+  const STARTER = `// Return { data: {...} } - each key becomes a measurement.
+function decodeUplink(input) {
+  var b = input.bytes;
+  return { data: {
+    // example for [uint16 value*100, uint16 battery mV]:
+    // value: ((b[0] << 8) | b[1]) / 100,
+    // battery: (b[2] << 8) | b[3],
+    raw_length: b.length,
+  } };
+}`;
+  const [form, setForm] = useState({ name: "", description: "", lorawanVersion: "1.0.3", klass: "A", decoderScript: STARTER });
+  const create = useMutation({
+    mutationFn: () => api.createDeviceType({ name: form.name, region: "US915", lorawanVersion: form.lorawanVersion, class: form.klass, description: form.description, decoderScript: form.decoderScript }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["device-types"] }); setOpen(false); toast.success("Device type added — it now appears in the add-sensor wizard"); },
+    onError: (e: Error) => toast.error(e.message),
+  });
+  return <><PageHeader eyebrow="Catalog" title="Device types" description="Reusable definitions keep sensor setup, measurements, and network behavior consistent. Add your own for custom or DIY hardware." action={<Button onClick={() => setOpen(true)}><Plus size={16}/>Add type</Button>}/>{query.isLoading ? <LoadingCards/> : <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{query.data?.items.map(type => <Card key={type.id}><CardContent className="pt-5"><div className="flex items-start justify-between"><div className="rounded-xl bg-[var(--accent-soft)] p-3 text-[var(--accent)]"><Activity size={20}/></div><Badge tone="neutral">Class {type.class}</Badge></div><h2 className="mt-5 font-semibold">{type.name}</h2><p className="mt-1 text-sm text-[var(--muted)]">{type.region} · {type.lorawanVersion.replace("LORAWAN_", "LoRaWAN ").replace(/_/g, ".")}</p><div className="mt-5 flex flex-wrap gap-2">{(type as any).hasDecoder ? <Badge tone="success">Decoder installed</Badge> : <Badge tone="warning">No decoder yet</Badge>}</div></CardContent></Card>)}</div>}{open && <Modal title="Add a custom device type" body="For DIY and unsupported hardware (Mayfly dataloggers, Arduino builds, other vendors). You define the payload, so you own the decoder." onClose={() => setOpen(false)}><div className="space-y-4"><Field label="Type name"><Input value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="e.g. EnviroDIY Mayfly - DO logger"/></Field><Field label="Description (optional)"><Input value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} placeholder="What it measures, where it lives"/></Field><div className="grid grid-cols-2 gap-3"><Field label="LoRaWAN version" hint="Check your radio module's docs. XBee LR = 1.0.4, most others 1.0.2/1.0.3."><Select value={form.lorawanVersion} onChange={e => setForm({ ...form, lorawanVersion: e.target.value })}><option value="1.0.2">1.0.2</option><option value="1.0.3">1.0.3</option><option value="1.0.4">1.0.4</option></Select></Field><Field label="Device class" hint="A = battery (listens after sending). C = always powered."><Select value={form.klass} onChange={e => setForm({ ...form, klass: e.target.value })}><option>A</option><option>C</option></Select></Field></div><Field label="Payload decoder (JavaScript)" hint="Turns your device's raw bytes into named readings. The starter passes bytes through so you can see data arrive, then refine."><textarea className="h-44 w-full rounded-lg border bg-[var(--surface-muted)] p-3 font-mono text-xs leading-5 outline-none focus:border-[var(--accent)]" value={form.decoderScript} onChange={e => setForm({ ...form, decoderScript: e.target.value })} spellCheck={false}/></Field><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => setOpen(false)}>Cancel</Button><Button disabled={form.name.length < 2 || create.isPending} onClick={() => create.mutate()}>{create.isPending ? "Adding…" : "Add type"}</Button></div></div></Modal>}</>;
 }
+
 
 export function DataPage() {
   const devices = useQuery({ queryKey: ["devices"], queryFn: api.devices }); const [eui, setEui] = useState(""); const [from, setFrom] = useState(""); const [to, setTo] = useState(""); const selected = eui || devices.data?.items[0]?.eui || ""; const readings = useQuery({ queryKey: ["readings", selected, from, to], queryFn: () => api.readings(selected, { from: from || undefined, to: to || undefined, limit: 50 }), enabled: Boolean(selected) }); const sensor = devices.data?.items.find(d => d.eui === selected); const keys = Object.keys(readings.data?.items[0]?.measurements || {}); const dataUrl = `${API_BASE}/devices/${selected}/readings`;
