@@ -24,7 +24,7 @@ const app = new Hono();
 // Browser CORS restricted to our own front-ends. The public data API is
 // machine-to-machine (x-api-key), so it isn't affected by this.
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS ??
-  "https://your-app-domain,https://your-admin-domain,https://fieldline-tau.vercel.app,https://your-admin-domain,http://localhost:3000,http://localhost:3100").split(",");
+  "https://your-app-domain,https://your-admin-domain,https://fieldline-tau.vercel.app,https://fieldline-admin.vercel.app,http://localhost:3000,http://localhost:3100").split(",");
 app.use("*", cors({ origin: (o) => (o && ALLOWED_ORIGINS.includes(o) ? o : ""), credentials: false }));
 
 // ── brute-force throttle (per-node; Redis-backed at multi-node, see ARCHITECTURE) ──
@@ -305,7 +305,7 @@ app.post("/orgs", async (c) => {
 });
 
 // ---------- platform operators (who can onboard schools) ----------
-const ADMIN_URL = process.env.ADMIN_URL ?? "https://your-admin-domain";
+const ADMIN_URL = process.env.ADMIN_URL ?? "https://fieldline-admin.vercel.app";
 app.get("/operators", (c) => {
   const me = authUser(c)!; if (!isPlatformAdmin(me)) return c.json({ error: "platform admins only" }, 403);
   const items = store.get().users.filter(isPlatformAdmin).map(u => ({ ...pub(u), builtIn: PLATFORM_ADMINS.includes(u.email) }));
@@ -695,14 +695,15 @@ app.post("/devices/:eui/commands/reporting-interval", async (c) => {
 });
 
 // ---------- alerts (computed, org-scoped) ----------
-app.get("/alerts", async (c) => {
-  const org = await orgOf(authUser(c)!);
+type Alert = { id: string; type: string; target: string; message: string; time: string };
+// Shared by GET /alerts and the push worker so on-screen and pushed alerts agree.
+async function computeAlerts(tenantId: string, appId: string): Promise<Alert[]> {
   const [gws, devs, states] = await Promise.all([
-    cs<any>("GET", `/api/gateways?limit=100&tenantId=${org.tenantId}`),
-    cs<any>("GET", `/api/devices?limit=100&applicationId=${org.appId}`),
+    cs<any>("GET", `/api/gateways?limit=100&tenantId=${tenantId}`),
+    cs<any>("GET", `/api/devices?limit=100&applicationId=${appId}`),
     deviceStates(),
   ]);
-  const alerts: any[] = [];
+  const alerts: Alert[] = [];
   for (const g of gws.result ?? []) {
     if (g.lastSeenAt && statusFrom(g.lastSeenAt) === "offline")
       alerts.push({ id: `gw:${g.gatewayId}`, type: "gateway_offline", target: g.name, message: `${g.name} has not connected since ${new Date(g.lastSeenAt).toLocaleString()}`, time: g.lastSeenAt });
@@ -714,13 +715,80 @@ app.get("/alerts", async (c) => {
     const b = battery(d) ?? st.battery ?? null;
     if (b != null && b <= 15)
       alerts.push({ id: `bat:${d.devEui}`, type: "low_battery", target: d.name, message: `${d.name} battery at ${b}%`, time: d.lastSeenAt ?? new Date().toISOString() });
-    // real network errors from the event log (bad key etc.) in the last 24h.
-    // Only ERROR level alerts — warnings like fCnt retransmission are routine.
     if (st.lastError && st.lastError.level === "ERROR" && Date.now() - new Date(st.lastError.time).getTime() < 24 * 3600e3)
       alerts.push({ id: `err:${d.devEui}`, type: "network_error", target: d.name, message: `${st.lastError.code}: ${st.lastError.description}`, time: st.lastError.time });
   }
-  return c.json({ items: alerts.sort((a, b) => (b.time > a.time ? 1 : -1)) });
+  return alerts.sort((a, b) => (b.time > a.time ? 1 : -1));
+}
+app.get("/alerts", async (c) => {
+  const org = await orgOf(authUser(c)!);
+  const alerts = await computeAlerts(org.tenantId, org.appId);
+  return c.json({ items: alerts });
 });
+
+// ---------- push notifications (mobile) ----------
+// Register the device's Expo push token so serious alerts can reach the phone.
+app.post("/push/register", async (c) => {
+  const me = authUser(c)!;
+  const org = await orgOf(me);
+  const { token, platform } = await c.req.json();
+  if (!token || !String(token).startsWith("ExponentPushToken")) return c.json({ error: "Expected an Expo push token" }, 400);
+  const db = store.get();
+  db.pushTokens = (db.pushTokens ?? []).filter(t => t.token !== token);
+  db.pushTokens.push({ token, userId: me.id, orgId: org.tenantId, platform, createdAt: new Date().toISOString() });
+  save();
+  return c.json({ ok: true });
+});
+app.post("/push/unregister", async (c) => {
+  const { token } = await c.req.json();
+  const db = store.get();
+  db.pushTokens = (db.pushTokens ?? []).filter(t => t.token !== token);
+  save();
+  return c.json({ ok: true });
+});
+
+// Which alert types are urgent enough to interrupt someone's day.
+const SERIOUS = new Set(["gateway_offline", "network_error", "sensor_offline"]);
+async function sendExpoPush(tokens: string[], title: string, body: string, data: object) {
+  if (!tokens.length) return;
+  const messages = tokens.map(to => ({ to, title, body, data, sound: "default", priority: "high", channelId: "alerts" }));
+  try {
+    await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST", headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify(messages), signal: AbortSignal.timeout(10_000),
+    });
+  } catch (e) { console.error("push send failed:", e); }
+}
+// Worker: per org with registered phones, push each NEW serious alert once.
+// First pass per org SEEDS the seen-set silently so a restart doesn't refire
+// every already-standing alert.
+let pushWorking = false;
+setInterval(async () => {
+  if (pushWorking) return; pushWorking = true;
+  try {
+    const db = store.get();
+    const byOrg = new Map<string, string[]>();
+    for (const t of db.pushTokens ?? []) { (byOrg.get(t.orgId) ?? byOrg.set(t.orgId, []).get(t.orgId)!).push(t.token); }
+    for (const [orgId, tokens] of byOrg) {
+      let org; try { org = await tenantInfo(orgId); } catch { continue; }
+      const alerts = (await computeAlerts(org.tenantId, org.appId)).filter(a => SERIOUS.has(a.type));
+      const seen = new Set(db.alertSeen?.[orgId] ?? []);
+      const firstRun = !(orgId in (db.alertSeen ?? {}));
+      const fresh = alerts.filter(a => !seen.has(a.id));
+      if (!firstRun) {
+        for (const a of fresh) {
+          const title = a.type === "gateway_offline" ? "Gateway offline"
+            : a.type === "network_error" ? "Sensor network error" : "Sensor went quiet";
+          await sendExpoPush(tokens, `⚠️ ${title}`, a.message, { alertId: a.id, type: a.type });
+        }
+      }
+      db.alertSeen = db.alertSeen ?? {};
+      db.alertSeen[orgId] = alerts.map(a => a.id);   // remember current standing set
+      save();
+    }
+  } catch (e) { console.error("push worker:", e); }
+  pushWorking = false;
+}, 60_000);
 
 // ---------- API tokens (org-scoped) ----------
 app.get("/tokens", async (c) => {

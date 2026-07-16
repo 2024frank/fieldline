@@ -28,7 +28,8 @@ export type Integration = {
   lastSent: Record<string, string>; // devEui -> last reading time delivered
 };
 
-type Db = { users: AppUser[]; tokens: ApiToken[]; integrations: Integration[] };
+export type PushToken = { token: string; userId: string; orgId: string; platform?: string; createdAt: string };
+type Db = { users: AppUser[]; tokens: ApiToken[]; integrations: Integration[]; pushTokens?: PushToken[]; alertSeen?: Record<string, string[]> };
 
 let db: Db | null = null;
 
@@ -37,6 +38,7 @@ function load(): Db {
   try { db = JSON.parse(fs.readFileSync(DATA_PATH, "utf8")); }
   catch { db = { users: [], tokens: [], integrations: [] }; }
   db!.users ??= []; db!.tokens ??= []; db!.integrations ??= [];
+  db!.pushTokens ??= []; db!.alertSeen ??= {};
   return db!;
 }
 export function save() {
