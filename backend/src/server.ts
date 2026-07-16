@@ -177,7 +177,7 @@ async function latestByEui(euis: Set<string>): Promise<Record<string, { measurem
 }
 // latest join / battery / error per device, from the datastore's event log
 const STATE_URL = READINGS_URL.replace(/\/readings$/, "/state");
-type DevState = { lastJoinAt?: string; battery?: number | null; margin?: number | null; extPower?: boolean; lastError?: { code: string; description: string; time: string } };
+type DevState = { lastJoinAt?: string; battery?: number | null; margin?: number | null; extPower?: boolean; lastError?: { code: string; description: string; time: string; level?: string | null } };
 async function deviceStates(): Promise<Record<string, DevState>> {
   try { const r = await fetch(STATE_URL); return await r.json() as Record<string, DevState>; } catch { return {}; }
 }
@@ -494,14 +494,24 @@ app.get("/devices/:eui", async (c) => {
 app.post("/devices", async (c) => {
   try {
     const org = await orgOf(authUser(c)!);
-    const { name, eui, typeId } = await c.req.json();
+    const { name, eui, typeId, appKey: providedKey } = await c.req.json();
     const devEui = String(eui).toLowerCase();
+    // caller may supply the key the sensor ALREADY knows (factory/vendor key):
+    // then nothing has to be written into the hardware at all
+    let appKey: string;
+    let keySource: "provided" | "generated";
+    if (providedKey) {
+      const norm = String(providedKey).replace(/[^0-9a-fA-F]/g, "").toLowerCase();
+      if (norm.length !== 32) return c.json({ error: "An application key is 32 hex characters — check the value from your box/vendor" }, 400);
+      appKey = norm; keySource = "provided";
+    } else {
+      appKey = randomHex(16); keySource = "generated";
+    }
     await cs("POST", "/api/devices", { device: { devEui, name, applicationId: org.appId, deviceProfileId: typeId, description: "Created via Fieldline" } });
-    const appKey = randomHex(16); // 32 hex chars
     // LoRaWAN 1.0.x: the AppKey must go in the nwkKey field (ChirpStack quirk)
     await cs("POST", `/api/devices/${devEui}/keys`, { deviceKeys: { devEui, nwkKey: appKey, appKey: "" } });
     euiCache.delete(org.appId);
-    return c.json({ device: { eui: devEui, name, typeId, typeName: "", status: "never", lastSeenAt: null, battery: null, latest: null }, appKey });
+    return c.json({ device: { eui: devEui, name, typeId, typeName: "", status: "never", lastSeenAt: null, battery: null, latest: null }, appKey, keySource });
   } catch (e) { return err400(c, e, "ChirpStack rejected this sensor — is the hardware ID already registered?"); }
 });
 app.patch("/devices/:eui", async (c) => {
@@ -588,8 +598,9 @@ app.get("/alerts", async (c) => {
     const b = battery(d) ?? st.battery ?? null;
     if (b != null && b <= 15)
       alerts.push({ id: `bat:${d.devEui}`, type: "low_battery", target: d.name, message: `${d.name} battery at ${b}%`, time: d.lastSeenAt ?? new Date().toISOString() });
-    // real network errors from the event log (bad key, framing issues) in the last 24h
-    if (st.lastError && Date.now() - new Date(st.lastError.time).getTime() < 24 * 3600e3)
+    // real network errors from the event log (bad key etc.) in the last 24h.
+    // Only ERROR level alerts — warnings like fCnt retransmission are routine.
+    if (st.lastError && st.lastError.level === "ERROR" && Date.now() - new Date(st.lastError.time).getTime() < 24 * 3600e3)
       alerts.push({ id: `err:${d.devEui}`, type: "network_error", target: d.name, message: `${st.lastError.code}: ${st.lastError.description}`, time: st.lastError.time });
   }
   return c.json({ items: alerts.sort((a, b) => (b.time > a.time ? 1 : -1)) });

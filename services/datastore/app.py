@@ -35,6 +35,10 @@ def db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         dev_eui TEXT, kind TEXT, ts TEXT, code TEXT, detail TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_ev ON events(dev_eui, id)")
+    try:
+        c.execute("ALTER TABLE events ADD COLUMN level TEXT")
+    except sqlite3.OperationalError:
+        pass
     return c
 
 def rowdict(r):
@@ -72,8 +76,8 @@ def on_message(client, userdata, msg):
             c.execute("INSERT INTO events(dev_eui,kind,ts,code,detail) VALUES(?,?,?,?,?)",
                       (eui, "status", e.get("time"), "STATUS", json.dumps(detail)))
         elif kind == "log":
-            c.execute("INSERT INTO events(dev_eui,kind,ts,code,detail) VALUES(?,?,?,?,?)",
-                      (eui, "log", e.get("time"), e.get("code"), e.get("description")))
+            c.execute("INSERT INTO events(dev_eui,kind,ts,code,detail,level) VALUES(?,?,?,?,?,?)",
+                      (eui, "log", e.get("time"), e.get("code"), e.get("description"), e.get("level")))
         c.commit(); c.close()
         print("stored %s from %s" % (kind, eui), flush=True)
     except Exception as ex:
@@ -160,7 +164,7 @@ def events():
     except ValueError:
         limit = 50
     c = db()
-    rows = c.execute("SELECT dev_eui,kind,ts,code,detail FROM events ORDER BY id DESC LIMIT 2000").fetchall()
+    rows = c.execute("SELECT dev_eui,kind,ts,code,detail,level FROM events ORDER BY id DESC LIMIT 2000").fetchall()
     c.close()
     out = []
     for r in rows:
@@ -168,7 +172,7 @@ def events():
             continue
         if kind and r[1] != kind:
             continue
-        out.append({"devEui": r[0], "kind": r[1], "time": r[2], "code": r[3], "detail": r[4]})
+        out.append({"devEui": r[0], "kind": r[1], "time": r[2], "code": r[3], "detail": r[4], "level": r[5] if len(r) > 5 else None})
         if len(out) >= limit:
             break
     return jsonify(out)
@@ -177,10 +181,12 @@ def events():
 def state():
     """Latest join / battery / error per device, folded from the events log."""
     c = db()
-    rows = c.execute("SELECT dev_eui,kind,ts,code,detail FROM events ORDER BY id DESC LIMIT 3000").fetchall()
+    rows = c.execute("SELECT dev_eui,kind,ts,code,detail,level FROM events ORDER BY id DESC LIMIT 3000").fetchall()
     c.close()
     out = {}
-    for dev_eui, kind, ts, code, detail in rows:  # newest first
+    for row in rows:  # newest first
+        dev_eui, kind, ts, code, detail = row[0], row[1], row[2], row[3], row[4]
+        level = row[5] if len(row) > 5 else None
         s = out.setdefault(dev_eui, {})
         if kind == "join" and "lastJoinAt" not in s:
             s["lastJoinAt"] = ts
@@ -194,7 +200,7 @@ def state():
             s["extPower"] = d.get("extPower")
             s["lastStatusAt"] = ts
         elif kind == "log" and "lastError" not in s:
-            s["lastError"] = {"code": code, "description": detail, "time": ts}
+            s["lastError"] = {"code": code, "description": detail, "time": ts, "level": level}
     return jsonify(out)
 
 @app.get("/health")
