@@ -1,0 +1,73 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f4f7f5;
+  --foreground: #0d1c14;
+  --surface: #ffffff;
+  --surface-muted: #eef2ee;
+  --border: #dfe6df;
+  --muted: #68746c;
+  --accent: #0d8557;
+  --accent-strong: #086943;
+  --accent-soft: rgba(13, 133, 87, .12);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0c120f;
+    --foreground: #eef6f0;
+    --surface: #121b16;
+    --surface-muted: #1b2820;
+    --border: #26382d;
+    --muted: #9aaaa0;
+    --accent: #31a86e;
+    --accent-strong: #258c5a;
+    --accent-soft: rgba(49, 168, 110, .16);
+  }
+}
+
+.dark {
+  --background: #0c120f;
+  --foreground: #eef6f0;
+  --surface: #121b16;
+  --surface-muted: #1b2820;
+  --border: #26382d;
+  --muted: #9aaaa0;
+  --accent: #31a86e;
+  --accent-strong: #258c5a;
+  --accent-soft: rgba(49, 168, 110, .16);
+  color-scheme: dark;
+}
+
+.light {
+  --background: #f6f8f6;
+  --foreground: #142019;
+  --surface: #ffffff;
+  --surface-muted: #eef2ee;
+  --border: #dfe6df;
+  --muted: #68746c;
+  --accent: #167a4b;
+  --accent-strong: #0e663d;
+  --accent-soft: rgba(22, 122, 75, .14);
+  color-scheme: light;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  min-height: 100vh;
+}
+
+body::before { content: ""; position: fixed; inset: 0; pointer-events: none; background-image: radial-gradient(circle at 12% 0%, rgba(13,133,87,.045), transparent 24%); z-index: -1; }
+
+* { border-color: var(--border); }
+button, a, input, select { -webkit-tap-highlight-color: transparent; }
+::selection { background: var(--accent-soft); }

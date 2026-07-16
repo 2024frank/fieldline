@@ -1,0 +1,114 @@
+# Fieldline server stack: ChirpStack v4 + the Fieldline backend + datastore,
+# behind Caddy with automatic HTTPS. Sanitized example — fill in the
+# environment values marked change-me.
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      - chirpstack
+
+  backend:
+    build: ../backend
+    restart: unless-stopped
+    environment:
+      - CHIRPSTACK_GRPC=http://chirpstack:8080
+      - CHIRPSTACK_REST=http://chirpstack-rest-api:8090
+      - CHIRPSTACK_ADMIN_USER=admin
+      - CHIRPSTACK_ADMIN_PASS=change-me
+      - READINGS_URL=http://datastore:8000/readings
+      - JWT_SECRET=change-me-long-random
+      - DATA_PATH=/data/fieldline.json
+      - PLATFORM_ADMINS=admin
+      - PUBLIC_HOST=your.server.ip
+      # optional onboarding emails (Resend, verified domain)
+      - RESEND_API_KEY=
+      - MAIL_FROM=Fieldline <fieldline@yourdomain.com>
+      - APP_URL=https://your-app-domain
+      - ADMIN_URL=https://your-admin-domain
+    volumes:
+      - backendvol:/data
+    depends_on:
+      - chirpstack
+      - chirpstack-rest-api
+      - datastore
+
+  datastore:
+    image: python:3.12-slim
+    restart: unless-stopped
+    command: sh -c "pip install --quiet --root-user-action=ignore paho-mqtt==1.6.1 flask && python /app/app.py"
+    volumes:
+      - ../services/datastore:/app
+      - datastorevol:/data
+    environment:
+      - MQTT_HOST=mosquitto
+      - MQTT_USER=chirpstack
+      - MQTT_PASS=change-me
+      - DB_PATH=/data/readings.db
+    depends_on:
+      - mosquitto
+
+  chirpstack:
+    image: chirpstack/chirpstack:4
+    command: -c /etc/chirpstack
+    restart: unless-stopped
+    volumes:
+      - ./configuration/chirpstack:/etc/chirpstack
+    depends_on:
+      - postgres
+      - mosquitto
+      - redis
+    environment:
+      - MQTT_BROKER_HOST=mosquitto
+      - REDIS_HOST=redis
+      - POSTGRESQL_HOST=postgres
+    ports:
+      - "8080:8080"
+
+  chirpstack-rest-api:
+    image: chirpstack/chirpstack-rest-api:4
+    restart: unless-stopped
+    command: --server chirpstack:8080 --bind 0.0.0.0:8090 --insecure
+    depends_on:
+      - chirpstack
+
+  postgres:
+    image: postgres:14-alpine
+    restart: unless-stopped
+    volumes:
+      - ./configuration/postgresql/initdb:/docker-entrypoint-initdb.d
+      - postgresqldata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=chirpstack
+      - POSTGRES_PASSWORD=change-me
+      - POSTGRES_DB=chirpstack
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 300 1 --save 60 100 --appendonly no
+    volumes:
+      - redisdata:/data
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./configuration/mosquitto/config/:/mosquitto/config/
+
+volumes:
+  backendvol:
+  datastorevol:
+  caddydata:
+  caddyconfig:
+  postgresqldata:
+  redisdata:

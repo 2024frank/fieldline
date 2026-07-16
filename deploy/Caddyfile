@@ -1,0 +1,11 @@
+# Replace with your domain (or use <ip-with-dashes>.sslip.io for instant HTTPS
+# on a bare IP, e.g. 203-0-113-10.sslip.io)
+your-domain.example.com {
+    handle_path /store/* {
+        reverse_proxy datastore:8000
+    }
+    handle_path /api/* {
+        reverse_proxy backend:4000
+    }
+    reverse_proxy chirpstack:8080
+}

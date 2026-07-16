@@ -1,0 +1,1 @@
+import { AppShell } from "@/components/app-shell"; import { GatewayDetailPage } from "@/components/platform-pages"; export default async function Page({params}:{params:Promise<{eui:string}>}){const {eui}=await params;return <AppShell><GatewayDetailPage eui={eui}/></AppShell>}

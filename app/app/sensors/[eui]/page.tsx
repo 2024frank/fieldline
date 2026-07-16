@@ -1,0 +1,1 @@
+import { AppShell } from "@/components/app-shell"; import { SensorDetailPage } from "@/components/platform-pages"; export default async function Page({params}:{params:Promise<{eui:string}>}){const {eui}=await params;return <AppShell><SensorDetailPage eui={eui}/></AppShell>}
